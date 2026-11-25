@@ -40,8 +40,8 @@ jobs:
           cp "target/${TARGET}/release/aten-vm" dist/
           strip dist/aten-vm
           tar -czf "dist/aten-vm-${GITHUB_REF_NAME}-linux-amd64.tar.gz" -C dist aten-vm
-          sha256sum "dist/aten-vm-${GITHUB_REF_NAME}-linux-amd64.tar.gz" \
-            > "dist/aten-vm-${GITHUB_REF_NAME}-linux-amd64.tar.gz.sha256"
+          (cd dist && sha256sum "aten-vm-${GITHUB_REF_NAME}-linux-amd64.tar.gz" \
+            > "aten-vm-${GITHUB_REF_NAME}-linux-amd64.tar.gz.sha256")
 
       - name: Publish
         uses: softprops/action-gh-release@v3
