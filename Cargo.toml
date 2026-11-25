@@ -1,0 +1,12 @@
+[package]
+name = "aten-vm"
+version = "0.1.0"
+edition = "2024"
+description = "ATEN/Supermicro legacy virtual CD-ROM client"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+quick-xml = "0.38"

@@ -1,0 +1,3 @@
+Minting tokens once (no automatic login retries)...
+aten-vm: web login rejected: SID cleared/invalid (bad credentials or session rejection); not retrying
+HARNESS: exit=1, elapsed=1.5s, mount_setup_seen=False, SIGINT_sent=False; one invocation, no login retry
