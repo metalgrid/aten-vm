@@ -4,19 +4,51 @@ A small Rust client for the legacy ATEN/Supermicro vUSB protocol. It serves a
 **local, read-only ISO** as a virtual CD-ROM; it does not open a KVM session,
 upload an image to the BMC, or implement any power/reset operations.
 
-## Build and run
+## Download a release
+
+Static linux/amd64 binaries are attached to every
+[GitHub release](https://github.com/metalgrid/aten-vm/releases) tagged `v*`:
+`aten-vm-<tag>-linux-amd64.tar.gz` plus a matching `.sha256` file. The binary
+is statically linked and needs no runtime libraries. CI builds each release
+from its tagged commit. The checksum comes from the same CI run; it detects
+transfer corruption, not tampering.
 
 ```sh
+tag=v0.1.1
+curl -LO "https://github.com/metalgrid/aten-vm/releases/download/${tag}/aten-vm-${tag}-linux-amd64.tar.gz"
+curl -LO "https://github.com/metalgrid/aten-vm/releases/download/${tag}/aten-vm-${tag}-linux-amd64.tar.gz.sha256"
+sha256sum -c "aten-vm-${tag}-linux-amd64.tar.gz.sha256"
+tar xzf "aten-vm-${tag}-linux-amd64.tar.gz"
+```
+
+## Build from source
+
+You need Rust 1.85 or newer (the crate uses edition 2024) and a C compiler
+for linking. TLS uses rustls; there is no OpenSSL dependency.
+
+```sh
+cargo build --release    # binary: target/release/aten-vm
 cargo test
-cargo build --release
-./target/release/aten-vm --host 172.31.224.254 \
+```
+
+For a static binary like the released artifact:
+
+```sh
+rustup target add x86_64-unknown-linux-musl   # also install musl-tools
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+## Run
+
+```sh
+./aten-vm --host 172.31.224.254 \
   --user ADMIN --pass 'YOUR_PASSWORD' --iso /path/to/image.iso
 ```
 
 Or use the two **literal** JNLP arguments 1 and 2, without base64-decoding them:
 
 ```sh
-./target/release/aten-vm --host 172.31.224.254 \
+./aten-vm --host 172.31.224.254 \
   --token-pair 'USER_TOKEN' 'PASS_TOKEN' --iso /path/to/image.iso
 ```
 
@@ -103,11 +135,11 @@ data transfers may span several TCP packets.
 
 ## Verification
 
-Verified locally with Rust 1.99.0 and Cargo 1.99.0:
+Checked with Rust 1.100.0 and Cargo 1.100.0; release CI runs the same checks:
 
 ```text
 cargo fmt --check                         PASS
-cargo test                               18 passed; 0 failed
+cargo test                               22 passed; 0 failed
 cargo clippy --all-targets -- -D warnings PASS
 cargo build --release                    Finished release profile [optimized]
 ```
