@@ -54,6 +54,15 @@ Or use the two **literal** JNLP arguments 1 and 2, without base64-decoding them:
 
 Optional `--slot N` selects a zero-based slot 0–2 (default 0).
 `--port N` overrides the JNLP vUSB port; token-pair mode defaults to port 623.
+In `--html5` mode it overrides the HTTPS/WebSocket port instead (default 443).
+
+Firmwares with the Java viewer disabled need `--html5`, the Insyde HTML5
+virtual-media path: the same tokens are minted from the iKVM/HTML5 bootstrap
+page, and media serves over a `wss://host/vm` WebSocket. Without the flag the
+legacy JNLP flow is tried once and the HTML5 flow follows if it fails
+(`--eject` clears a stale slot registration and can be rejected with status 2
+when no registration exists). `--proxy socks5://host:port` routes all BMC
+traffic, web and media, through a SOCKS5 proxy.
 Use Ctrl-C to detach and exit. Keep the program running while the target
 machine uses the disc. The ISO must be a nonempty regular file whose size is
 a multiple of 2048 bytes. Do not modify or replace its contents while serving.
@@ -90,6 +99,8 @@ network, **not a secure virtual-media protocol**:
 * `src/proto.rs`: bounded TCP frame parsing, occupancy probes,
   endpoint mapping, SCSI responses and on-demand ISO sector reads. See
   `PROTOCOL-API.md` for wire evidence and integration details.
+* `src/websock.rs`: the HTML5 transport — a binary-frame WebSocket over TLS
+  or SOCKS5, presented as a byte stream so the SCSI core is transport-agnostic.
 * `src/main.rs`: CLI validation, lifecycle, same-token reconnect and Ctrl-C.
 
 The local references are `../inspection/vusb-auth.md`,
@@ -130,8 +141,14 @@ data transfers may span several TCP packets.
   abandons the first connection without a FIN. `serve` detects 30s of frame
   silence, classifies it as a disconnect, and the first instance then exits
   through the normal reconnect/probe path (it will report the slot as busy).
-* The mount ends with the TCP session. A reconnect can cause a guest-visible
-  media detach/reattach and cannot guarantee uninterrupted boot.
+* The mount ends with the TCP session (the WebSocket session in HTML5 mode).
+  A reconnect can cause a guest-visible media detach/reattach and cannot
+  guarantee uninterrupted boot.
+* The HTML5 path is evidence-based from one firmware: Supermicro/Insyde
+  01.73.11 (2021-03-10), verified live including mount and unmount. Other
+  HTML5 firmwares share the client scripts but are unverified. The legacy
+  path targets the 2019 ATEN firmware and was not re-tested live for this
+  release.
 
 ## Verification
 
@@ -145,7 +162,10 @@ cargo build --release                    Finished release profile [optimized]
 ```
 
 The offline replay test checks **88 captured PDUs / 34 SCSI commands / 15
-sector reads** byte-for-byte. Other tests cover RC4, the complete auth vector,
+sector reads** byte-for-byte. HTML5 was verified live on firmware 01.73.11:
+token minting with fallback, a 30-second mount with keepalives, refusal of a
+second concurrent mount ("slot 0 is busy"), and SIGINT unmount. SCSI reads
+only occur when a guest reads the media, so no guest reads were exercised. Other tests cover RC4, the complete auth vector,
 split/coalesced/oversized frames, occupied slots, invalid acknowledgements,
 read bounds, sense/residue, multi-chunk reads, and shutdown during a response.
 

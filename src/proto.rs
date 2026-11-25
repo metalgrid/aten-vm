@@ -145,15 +145,14 @@ fn validate_status(frame: &Frame, slot: u8) -> Result<()> {
     Ok(())
 }
 
-/// Use a separate short-lived TCP connection, exactly as capture streams 0/3.
-/// Stream 1's 0a/0b exchange only discovers HTTP port 80 and is unnecessary here.
+/// Use a separate short-lived connection, exactly as capture streams 0/3.
+/// Over the HTML5 WebSocket the same exchange opens connection one; the mount
+/// itself runs on a second connection, as the firmware client does.
 pub async fn probe(host: &str, port: u16, slot: u8) -> Result<()> {
     check_slot(slot)?;
     timeout(IO_TIMEOUT, async {
         let mut stream = TcpStream::connect((host, port)).await?;
-        write_frame(&mut stream, [0, 0, 0, 8], &[]).await?;
-        let frame = read_frame(&mut stream).await?;
-        validate_status(&frame, slot)?;
+        probe_stream(&mut stream, slot).await?;
         stream.shutdown().await?;
         Ok(())
     })
@@ -164,6 +163,43 @@ pub async fn probe(host: &str, port: u16, slot: u8) -> Result<()> {
             "virtual-media slot probe timed out",
         )
     })?
+}
+
+pub async fn probe_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    slot: u8,
+) -> Result<()> {
+    check_slot(slot)?;
+    write_frame(stream, [0, 0, 0, 8], &[]).await?;
+    let frame = read_frame(stream).await?;
+    validate_status(&frame, slot)
+}
+
+/// The HTML5 client asks the firmware for its HTTP port ([0,0,0,10], 10-byte
+/// reply) before sending the plug-in packet. GetHttpPortFromFW reads the two
+/// payload bytes but does not use them for the WebSocket media path; the
+/// exchange is kept because it is part of every observed client mount.
+pub async fn http_port<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<u16> {
+    write_frame(stream, [0, 0, 0, 10], &[]).await?;
+    let frame = timeout(IO_TIMEOUT, read_frame(stream))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "virtual-media HTTP-port query timed out",
+            )
+        })??;
+    // The client counts exactly 10 bytes (8-byte header + 2) and never checks
+    // the kind, so neither does this; a different shape fails the mount below.
+    if frame.payload.len() != 2 {
+        return Err(format!(
+            "invalid virtual-media HTTP-port reply: kind={:02x?} len={}",
+            frame.kind,
+            frame.payload.len()
+        )
+        .into());
+    }
+    Ok(u16::from_le_bytes(frame.payload[..2].try_into().unwrap()))
 }
 
 pub fn validate_auth(frame: &Frame) -> Result<()> {
@@ -441,6 +477,9 @@ impl Disc {
                 sent = data.len() as u32;
             }
         }
+        // Over the HTML5 WebSocket each PDU must leave as its own message, so
+        // flush the (optional) data response before the status PDU.
+        stream.flush().await?;
         let mut csw = [0; 13];
         csw[..4].copy_from_slice(b"USBS");
         csw[4..8].copy_from_slice(&cbw[4..8]);

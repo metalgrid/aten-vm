@@ -1,9 +1,16 @@
 mod auth;
 mod mint;
 mod proto;
+mod websock;
 
 use clap::Parser;
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    io,
+    path::PathBuf,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
@@ -13,6 +20,61 @@ use tokio::{
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The mint and mount paths, chosen by the tokens or --html5.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// Raw legacy vUSB TCP (Java/JNLP flow tokens).
+    Legacy,
+    /// Insyde HTML5 WebSocket (`wss://host:port/vm`) with clear packets.
+    Html5,
+}
+
+/// One BMC data connection on either transport.
+enum Stream {
+    Tcp(TcpStream),
+    Ws(Box<websock::WsStream>),
+}
+
+impl tokio::io::AsyncRead for Stream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Stream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            Stream::Ws(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Stream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Stream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            Stream::Ws(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Stream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            Stream::Ws(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Stream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            Stream::Ws(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +111,14 @@ struct Args {
     /// clearing a stale registration left by a killed session (--iso not needed)
     #[arg(long)]
     eject: bool,
+    /// Force the Insyde HTML5 virtual-media path (wss://host:port/vm); without
+    /// this flag the legacy JNLP flow is tried once, then HTML5. --port means
+    /// the HTTPS/WebSocket port here instead of the legacy vUSB TCP port.
+    #[arg(long)]
+    html5: bool,
+    /// Route all BMC traffic through socks5://host:port
+    #[arg(long)]
+    proxy: Option<String>,
 }
 
 #[tokio::main]
@@ -67,6 +137,11 @@ async fn run(args: Args) -> Result<()> {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_owned();
+    let proxy = args
+        .proxy
+        .as_deref()
+        .map(websock::parse_proxy)
+        .transpose()?;
     // Reject ordinary FIFO/device inputs before a potentially blocking file open.
     if let Some(path) = args.iso.as_deref()
         && !tokio::fs::metadata(path).await?.is_file()
@@ -104,23 +179,34 @@ async fn run(args: Args) -> Result<()> {
     let tokens = match args.token_pair {
         Some(pair) => {
             auth::validate_tokens(&pair[0], &pair[1])?;
-            mint::Tokens {
-                user: pair[0].clone(),
-                pass: pair[1].clone(),
-                port: 623,
+            let mut tokens = mint::Tokens::legacy(pair[0].clone(), pair[1].clone(), 623);
+            if args.html5 {
+                tokens.html5 = true;
             }
+            tokens
         }
         None => {
             eprintln!("Minting tokens once (no automatic login retries)...");
             tokio::select! {
                 _ = shutdown.changed() => return Ok(()),
-                result = mint::mint(&args.host, args.user.as_deref().unwrap(), args.pass.as_deref().unwrap()) => result?,
+                result = mint::mint_auto(
+                    &args.host,
+                    args.user.as_deref().unwrap(),
+                    args.pass.as_deref().unwrap(),
+                    proxy.as_ref(),
+                    args.html5,
+                ) => result?,
             }
         }
     };
+    let mode = if tokens.html5 || args.html5 {
+        Mode::Html5
+    } else {
+        Mode::Legacy
+    };
     let port = args.port.unwrap_or(tokens.port);
     if args.eject {
-        eject(&host, port, args.slot, &tokens).await?;
+        eject(&host, port, args.slot, &tokens, mode, proxy.as_ref()).await?;
         signal.abort();
         return Ok(());
     }
@@ -133,7 +219,21 @@ async fn run(args: Args) -> Result<()> {
         // Query before every mount, including reconnects: never take over an occupied slot.
         let probe = tokio::select! {
             _ = shutdown.changed() => break,
-            result = proto::probe(&host, port, args.slot) => result,
+            result = timeout(IO_TIMEOUT, async {
+                match mode {
+                    Mode::Legacy => proto::probe(&host, port, args.slot).await,
+                    Mode::Html5 => {
+                        let mut stream =
+                            websock::connect(&host, port, &tokens.sid, proxy.as_ref()).await?;
+                        proto::probe_stream(&mut stream, args.slot).await?;
+                        Ok(())
+                    }
+                }
+            }) => match result {
+                Ok(inner) => inner,
+                Err(elapsed) => Err(Box::new(elapsed)
+                    as Box<dyn std::error::Error + Send + Sync>),
+            },
         };
         if let Err(error) = probe {
             if !reconnecting || !is_transport_failure(error.as_ref()) {
@@ -150,13 +250,13 @@ async fn run(args: Args) -> Result<()> {
         }
         let connection = tokio::select! {
             _ = shutdown.changed() => break,
-            result = timeout(IO_TIMEOUT, TcpStream::connect((host.as_str(), port))) => result,
+            result = timeout(IO_TIMEOUT, open_stream(mode, &host, port, &tokens.sid, proxy.as_ref())) => result,
         };
         let mut stream = match connection {
             Ok(Ok(stream)) => stream,
             outcome => {
                 let error: Box<dyn std::error::Error + Send + Sync> = match outcome {
-                    Ok(Err(e)) => Box::new(e),
+                    Ok(Err(e)) => e,
                     Err(e) => Box::new(e),
                     _ => unreachable!(),
                 };
@@ -175,12 +275,20 @@ async fn run(args: Args) -> Result<()> {
         if *shutdown.borrow() {
             break;
         }
-        stream.set_nodelay(true)?;
-        let auth = auth::build(&tokens.user, &tokens.pass, auth::nonce()?, args.slot)?;
+        let auth = match mode {
+            Mode::Legacy => auth::build(&tokens.user, &tokens.pass, auth::nonce()?, args.slot)?,
+            Mode::Html5 => {
+                auth::build_html5(&tokens.user, &tokens.pass, auth::nonce_html5()?, args.slot)?
+            }
+        };
         timeout(IO_TIMEOUT, stream.write_all(&auth))
             .await
             .map_err(|e| format!("vUSB auth send timed out: {e}"))?
             .map_err(|e| format!("vUSB auth send failed: {e}"))?;
+        timeout(IO_TIMEOUT, stream.flush())
+            .await
+            .map_err(|e| format!("vUSB auth flush timed out: {e}"))?
+            .map_err(|e| format!("vUSB auth flush failed: {e}"))?;
         // Any auth/mount failure is fatal, including during reconnect: never try variations.
         timeout(IO_TIMEOUT, proto::authenticate(&mut stream))
             .await
@@ -190,17 +298,24 @@ async fn run(args: Args) -> Result<()> {
             timeout(IO_TIMEOUT, proto::unmount(&mut stream, args.slot)).await??;
             break;
         }
-        proto::mount(&mut stream, args.slot)
-            .await
-            .map_err(|e| format!("vUSB mount setup send failed (closing session): {e}"))?;
+        if mode == Mode::Legacy {
+            proto::mount(&mut stream, args.slot)
+                .await
+                .map_err(|e| format!("vUSB mount setup send failed (closing session): {e}"))?;
+        }
         eprintln!(
-            "Mount setup sent for {} ({} sectors) on {host}:{port}, slot {}; Ctrl-C to unmount",
+            "Mount setup sent for {} ({} sectors) on {host}:{port}, slot {} ({}); Ctrl-C to unmount",
             args.iso
                 .as_ref()
                 .expect("iso present when mounting")
                 .display(),
             size / 2048,
-            args.slot
+            args.slot,
+            if mode == Mode::Html5 {
+                "HTML5 WebSocket"
+            } else {
+                "legacy vUSB TCP"
+            },
         );
         match proto::serve(&mut stream, &mut iso, size, args.slot, &mut shutdown).await {
             Ok(()) => {
@@ -210,14 +325,14 @@ async fn run(args: Args) -> Result<()> {
                 break;
             }
             Err(error) if is_disconnect(error.as_ref()) => {
-                eprintln!("TCP session dropped: {error}; reconnecting with the same tokens");
+                eprintln!("Connection dropped: {error}; reconnecting with the same tokens");
                 reconnecting = true;
                 if pause_or_stop(&mut shutdown).await {
                     break;
                 }
             }
             // A failed outbound write may be partial: do not append an unmount to a
-            // corrupt frame. Closing our TCP session also detaches the media.
+            // corrupt frame. Closing the session also detaches the media.
             Err(error) => return Err(error),
         }
     }
@@ -225,22 +340,68 @@ async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-async fn eject(host: &str, port: u16, slot: u8, tokens: &mint::Tokens) -> Result<()> {
-    let connection = timeout(IO_TIMEOUT, TcpStream::connect((host, port)))
+/// Open the data connection: raw TCP for the legacy path, or a fresh HTML5
+/// WebSocket that first carries the HTTP-port query, as the client scripts do.
+async fn open_stream(
+    mode: Mode,
+    host: &str,
+    port: u16,
+    sid: &str,
+    proxy: Option<&(String, u16)>,
+) -> Result<Stream> {
+    match mode {
+        Mode::Legacy => Ok(Stream::Tcp(TcpStream::connect((host, port)).await?)),
+        Mode::Html5 => {
+            // The firmware client runs the HTTP-port query on its own
+            // WebSocket and then reopens before the plug-in packet
+            // (UI_Mount_VM3 -> VMCreateConnection), so replicate that order.
+            let mut bootstrap = Stream::Ws(Box::new(
+                websock::connect(host, port, sid, proxy)
+                    .await
+                    .map_err(|e| format!("HTML5 WebSocket connect failed: {e}"))?,
+            ));
+            let _http_port = proto::http_port(&mut bootstrap).await?;
+            drop(bootstrap);
+            Ok(Stream::Ws(Box::new(
+                websock::connect(host, port, sid, proxy)
+                    .await
+                    .map_err(|e| format!("HTML5 WebSocket reconnect failed: {e}"))?,
+            )))
+        }
+    }
+}
+
+async fn eject(
+    host: &str,
+    port: u16,
+    slot: u8,
+    tokens: &mint::Tokens,
+    mode: Mode,
+    proxy: Option<&(String, u16)>,
+) -> Result<()> {
+    let mut stream = open_stream(mode, host, port, &tokens.sid, proxy)
         .await
-        .map_err(|_| "vUSB connect timed out during eject")??;
-    let mut stream = connection;
-    stream.set_nodelay(true)?;
-    let auth = auth::build(&tokens.user, &tokens.pass, auth::nonce()?, slot)?;
+        .map_err(|e| format!("vUSB connect timed out during eject: {e}"))?;
+    let auth = match mode {
+        Mode::Legacy => auth::build(&tokens.user, &tokens.pass, auth::nonce()?, slot)?,
+        Mode::Html5 => auth::build_html5(&tokens.user, &tokens.pass, auth::nonce_html5()?, slot)?,
+    };
     stream
         .write_all(&auth)
         .await
         .map_err(|e| format!("vUSB auth send failed: {e}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("vUSB auth flush failed: {e}"))?;
     proto::authenticate(&mut stream)
         .await
         .map_err(|e| format!("vUSB authentication failed: {e}"))?;
     proto::unmount(&mut stream, slot).await?;
-    eprintln!("Eject sent for slot {slot} on {host}:{port}; disconnecting.");
+    eprintln!(
+        "Eject sent for slot {slot} on {host}:{port}{}; disconnecting.",
+        if mode == Mode::Html5 { " (HTML5)" } else { "" }
+    );
     Ok(())
 }
 
